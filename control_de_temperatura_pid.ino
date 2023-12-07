@@ -1,72 +1,113 @@
-#include <PID_v1.h>
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
-// Definición de pines
-const int sensorPin = A0;
+const int ThermistorPin = A0;
 const int outputPin = 9; // Pin PWM de salida
 const int Pot = A1;
-// Parámetros PID
 
-double Kp = 0.729;         // Ganancia proporcional
-double Ki = 0.0103;        // Ganancia integral
-double Kd = 12.9;          // Ganancia derivativa
+const double R1 = 10000;
+const double c1 = 1.009249522e-03, c2 = 2.378405444e-04, c3 = 2.019202697e-07;
+const double voltageConversion = 5.0 / 1023.0; // Convertir lectura analógica a voltaje
+const double temperatureConversion = 100.0; // Convertir voltaje a temperatura (10mV = 1°C)
+
+// Parámetros PID
+double Kp = 0.0185; // Ganancia proporcional
+double Ki = 6.61e-05; // Ganancia integral
+double Kd =0.00231; // Ganancia derivativa
 
 // Variables PID
-double input, output, setpoint; // Declara setpoint aquí
-
-// Parámetros de conversión
-const double voltageConversion = 5.0 / 1023.0;  // Convertir lectura analógica a voltaje
-const double temperatureConversion = 100.0;      // Convertir voltaje a temperatura (10mV = 1°C)
-
-// Crear la instancia de PID fuera de cualquier función
-PID myPID(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
+double input, output, setpoint;
 
 // Variables para debouncing
-unsigned long lastPrintTime = 0; // Tiempo de la última impresión
-const unsigned long printInterval = 500; // Intervalo mínimo entre impresiones en milisegundos
+double lastError = 0; // Variable para término derivativo
+unsigned long lastPrintTime = 0; // Tiempo de última impresión
+const unsigned long printInterval = 500; // Intervalo entre impresiones (500 ms)
+
+// Función para calcular el término derivativo del PID
+double derivativeWithTs(double error, double lastError, double ts) {
+  return (error - lastError) / ts;
+}
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 void setup() {
-  // Inicialización de pines
   pinMode(outputPin, OUTPUT);
-
-  // Inicialización del PID
-  myPID.SetMode(AUTOMATIC);
-  
-  // Ajusta el rango de salida del PID al rango del PWM (0-255)
-  myPID.SetOutputLimits(0, 255);
-
-  // Inicia el puerto serie para imprimir valores
   Serial.begin(9600);
+
+  lcd.init();  // inicializar el lcd
+  lcd.backlight();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Coffe Hot Contrl");
+  lcd.setCursor(0, 1);
+  lcd.print("Elec. Potencia");
+  delay(5000);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Temp:");
+  lcd.setCursor(0, 1);
+  lcd.print("Tiempo:");
 }
 
 void loop() {
-  setpoint = analogRead(Pot) * voltageConversion * temperatureConversion/5; // Asigna valor a setpoint
+  if (millis() - lastPrintTime > printInterval) {
+    // Lectura del potenciómetro para el setpoint
+    setpoint = analogRead(Pot) * voltageConversion * temperatureConversion / 5;
 
-  // Lectura de la temperatura desde el sensor (en mV)
-  int sensorValue = analogRead(sensorPin)*voltageConversion*temperatureConversion;
-  
-  // Conversión de lectura analógica a voltaje
-  double voltage = sensorValue * voltageConversion;
+    // Lectura de la temperatura del sensor
+    int Vo = analogRead(ThermistorPin);
+    double R2 = R1 * (1023.0 / Vo - 1.0);
+    double logR2 = log(R2);
+    double T = 1.0 / (c1 + c2 * logR2 + c3 * logR2 * logR2 * logR2);
+    T = T - 273.15;
+    input = T;
 
-  // Conversión de voltaje a temperatura en grados Celsius
-  input = voltage * temperatureConversion;
+    // Cálculo manual del control PID
+    // Error
+    double error = setpoint - input;
 
-  // Cálculo del control PID
-  myPID.Compute();
+    // Término proporcional
+    double pTerm = Kp * error;
 
-  // Verificar si ha pasado suficiente tiempo desde la última impresión
-  if (millis() - lastPrintTime >= printInterval) {
-    // Imprimir valores de entrada y salida del PID
-    Serial.print("Input: ");
-    Serial.print(input);
-    Serial.print("   Output: ");
-    Serial.print(output);
-    Serial.print("   Setpoint: ");
-    Serial.println(setpoint);
+    // Término integral
+    static double integral = 0; // Variable estática para mantener el valor de la integral
+    integral += error * printInterval;
+    // Limitar la integral para evitar overflow/underflow
+    integral = constrain(integral, -1000, 1000);
+    double iTerm = Ki * integral;
 
-    // Actualizar el tiempo de la última impresión
-    lastPrintTime = millis();
+    // Cálculo del término derivativo
+    double derivative = derivativeWithTs(error, lastError, 0.25); // Cambiar el valor de ts a 0.25 segundos
+    lastError = error;
+
+    // Salida del PID
+    output = pTerm + iTerm + derivative;
+
+    // Limitar la salida del PID para el PWM
+    output = constrain(output, 0, 255);
+
+    // Verificar si ha pasado suficiente tiempo desde la última impresión
+    if (millis() - lastPrintTime > printInterval) {
+      // Imprimir valores de entrada y salida del PID
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Temp:");
+      lcd.setCursor(6, 0);
+      lcd.print(input, 1);
+      lcd.print("C");
+
+      lcd.setCursor(0, 1);
+      lcd.print("PWM:");
+      lcd.setCursor(8, 1);
+      lcd.print(output);
+
+      lastPrintTime = millis();
+    }
+
+    // Aplicación del PWM para controlar la potencia del elemento calefactor
+    analogWrite(outputPin, output);
   }
-
-  // Aplicación del PWM para controlar la potencia del elemento calefactor
-  analogWrite(outputPin, output);
 }
